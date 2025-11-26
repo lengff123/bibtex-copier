@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         选择文本并自动获取BibTex到剪切板
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  在网页右下角生成一个按钮，从dblp或Crossref中获取选定文本的BibTeX并复制到剪贴板，支持快捷键、预览和历史记录
+// @version      1.3
+// @description  在网页右下角生成一个按钮，从dblp或Crossref中获取选定文本的BibTeX并复制到剪贴板，支持DOI检测、多结果选择、导出历史记录
 // @author       ff
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -152,6 +152,13 @@ function makeRequest(options) {
           history_title:"搜索历史",
           clear_history:"清空历史",
           no_history:"暂无历史记录",
+          export_history:"导出历史记录",
+          doi_detected:"检测到 DOI，直接获取...",
+          multiple_results:"找到多个结果，请选择：",
+          select_result:"选择",
+          cancel:"取消",
+          export_success:"历史记录已导出！",
+          export_filename:"bibtex-history.bib",
         };
         break;
       case "zh":
@@ -174,6 +181,13 @@ function makeRequest(options) {
           history_title:"搜索歷史",
           clear_history:"清空歷史",
           no_history:"暫無歷史記錄",
+          export_history:"導出歷史記錄",
+          doi_detected:"檢測到 DOI，直接獲取...",
+          multiple_results:"找到多個結果，請選擇：",
+          select_result:"選擇",
+          cancel:"取消",
+          export_success:"歷史記錄已導出！",
+          export_filename:"bibtex-history.bib",
         };
         break;
       default:
@@ -194,6 +208,13 @@ function makeRequest(options) {
           history_title:"Search History",
           clear_history:"Clear History",
           no_history:"No history yet",
+          export_history:"Export History",
+          doi_detected:"DOI detected, fetching directly...",
+          multiple_results:"Multiple results found, please select:",
+          select_result:"Select",
+          cancel:"Cancel",
+          export_success:"History exported successfully!",
+          export_filename:"bibtex-history.bib",
         };
         break;
     }
@@ -246,18 +267,57 @@ function makeRequest(options) {
         button.style.display = 'none';
     }
   
-    // ========== 从 Crossref API 获取 BibTeX ==========
-    async function fetchBibTeXFromCrossref(query) {
-        // 检查缓存
-        const cacheKey = `crossref_${query}`;
+    // ========== DOI 检测函数 ==========
+    function extractDOI(text) {
+        // DOI 格式: 10.xxxx/xxxx 或 doi:10.xxxx/xxxx
+        const doiPattern = /(?:doi[:\s]*)?(10\.\d{4,}\/[^\s]+)/i;
+        const match = text.match(doiPattern);
+        return match ? match[1] : null;
+    }
+
+    // ========== 使用 DOI 直接获取 BibTeX ==========
+    async function fetchBibTeXByDOI(doi) {
+        const cacheKey = `doi_${doi}`;
         const cached = cache.get(cacheKey);
         if (cached) {
             return cached;
         }
 
         try {
-            // 第一步：搜索获取 DOI
-            const searchUrl = `https://api.crossref.org/works?query=${encodeURIComponent(query)}&rows=1`;
+            const bibtexUrl = `https://api.crossref.org/works/${encodeURIComponent(doi)}/transform/application/x-bibtex`;
+            const bibResponse = await makeRequest({
+                method: 'GET',
+                url: bibtexUrl,
+                headers: {
+                    "Accept": "application/x-bibtex",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
+            });
+
+            if (bibResponse.status === 200 && bibResponse.responseText.trim()) {
+                const bibtex = bibResponse.responseText;
+                cache.set(cacheKey, bibtex);
+                return bibtex;
+            }
+            return null;
+        } catch (error) {
+            console.error('DOI fetch error:', error);
+            return null;
+        }
+    }
+
+    // ========== 从 Crossref API 获取 BibTeX（支持多结果） ==========
+    async function fetchBibTeXFromCrossref(query, maxResults = 5) {
+        // 检查缓存
+        const cacheKey = `crossref_${query}`;
+        const cached = cache.get(cacheKey);
+        if (cached) {
+            return Array.isArray(cached) ? cached : [cached];
+        }
+
+        try {
+            // 搜索获取多个结果
+            const searchUrl = `https://api.crossref.org/works?query=${encodeURIComponent(query)}&rows=${maxResults}`;
             const response = await makeRequest({
                 method: 'GET',
                 url: searchUrl,
@@ -276,26 +336,26 @@ function makeRequest(options) {
                 return null;
             }
 
-            const doi = data.message.items[0].DOI;
-            if (!doi) {
-                return null;
+            // 获取所有结果的 BibTeX
+            const results = [];
+            for (const item of data.message.items) {
+                if (item.DOI) {
+                    const bibtex = await fetchBibTeXByDOI(item.DOI);
+                    if (bibtex) {
+                        results.push({
+                            bibtex: bibtex,
+                            title: item.title?.[0] || 'Unknown Title',
+                            authors: item.author?.map(a => `${a.given || ''} ${a.family || ''}`).join(', ') || 'Unknown Authors',
+                            year: item.published?.['date-parts']?.[0]?.[0] || 'Unknown Year',
+                            doi: item.DOI
+                        });
+                    }
+                }
             }
 
-            // 第二步：使用 DOI 获取 BibTeX
-            const bibtexUrl = `https://api.crossref.org/works/${encodeURIComponent(doi)}/transform/application/x-bibtex`;
-            const bibResponse = await makeRequest({
-                method: 'GET',
-                url: bibtexUrl,
-                headers: {
-                    "Accept": "application/x-bibtex",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                }
-            });
-
-            if (bibResponse.status === 200 && bibResponse.responseText.trim()) {
-                const bibtex = bibResponse.responseText;
-                cache.set(cacheKey, bibtex);
-                return bibtex;
+            if (results.length > 0) {
+                cache.set(cacheKey, results.length === 1 ? results[0].bibtex : results);
+                return results.length === 1 ? results[0].bibtex : results;
             }
             return null;
         } catch (error) {
@@ -472,15 +532,126 @@ function makeRequest(options) {
         }
     };
 
-    // ========== 主函数：尝试多个数据源 ==========
+    // ========== 多结果选择弹窗 ==========
+    function showMultipleResults(results, onSelect) {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = `
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 999998;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        `;
+        
+        const modal = document.createElement('div');
+        modal.style.cssText = `
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            max-width: 70%;
+            max-height: 80vh;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        `;
+        
+        const resultsList = results.map((result, index) => `
+            <div style="
+                padding: 16px;
+                border: 2px solid #e0e0e0;
+                border-radius: 8px;
+                margin-bottom: 12px;
+                cursor: pointer;
+                transition: all 0.2s;
+            " 
+            data-index="${index}" 
+            onmouseover="this.style.borderColor='#007BFF'; this.style.background='#f0f7ff'" 
+            onmouseout="this.style.borderColor='#e0e0e0'; this.style.background='white'">
+                <div style="font-weight: 600; margin-bottom: 8px; color: #333; font-size: 15px;">${result.title}</div>
+                <div style="font-size: 13px; color: #666; margin-bottom: 4px;">${result.authors}</div>
+                <div style="font-size: 12px; color: #999;">${result.year} • DOI: ${result.doi}</div>
+            </div>
+        `).join('');
+        
+        modal.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h3 style="margin: 0; color: #333;">${lang_hint.multiple_results}</h3>
+                <button id="close-results" style="background: none; border: none; font-size: 24px; cursor: pointer; color: #666;">&times;</button>
+            </div>
+            <div style="overflow-y: auto; flex: 1; margin-bottom: 16px;">
+                ${resultsList}
+            </div>
+            <div style="display: flex; gap: 12px; justify-content: flex-end;">
+                <button id="cancel-results" style="
+                    padding: 10px 20px;
+                    background: #6c757d;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    cursor: pointer;
+                ">${lang_hint.cancel}</button>
+            </div>
+        `;
+        
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+        
+        const closeModal = () => {
+            document.body.removeChild(overlay);
+        };
+        
+        modal.querySelector('#close-results').addEventListener('click', closeModal);
+        modal.querySelector('#cancel-results').addEventListener('click', closeModal);
+        
+        modal.querySelectorAll('[data-index]').forEach(item => {
+            item.addEventListener('click', () => {
+                const index = parseInt(item.getAttribute('data-index'));
+                onSelect(results[index]);
+                closeModal();
+            });
+        });
+        
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) closeModal();
+        });
+        
+        // ESC 键关闭
+        const escHandler = (e) => {
+            if (e.key === 'Escape') {
+                closeModal();
+                document.removeEventListener('keydown', escHandler);
+            }
+        };
+        document.addEventListener('keydown', escHandler);
+    }
+
+    // ========== 主函数：尝试多个数据源（支持 DOI 检测和多结果） ==========
     async function fetchBibTeX(query, showProgress = true) {
+        // 首先检查是否包含 DOI
+        const doi = extractDOI(query);
+        if (doi) {
+            if (showProgress) {
+                buttonState.setLoading(lang_hint.doi_detected);
+            }
+            const doiResult = await fetchBibTeXByDOI(doi);
+            if (doiResult) {
+                return { bibtex: doiResult, source: 'Crossref (DOI)', isMultiple: false };
+            }
+        }
+
         // 先尝试 DBLP（计算机科学领域）
         if (showProgress) {
             buttonState.setLoading(lang_hint.searching_dblp);
         }
         const dblpResult = await fetchBibTeXFromDBLP(query);
         if (dblpResult) {
-            return { bibtex: dblpResult, source: 'DBLP' };
+            return { bibtex: dblpResult, source: 'DBLP', isMultiple: false };
         }
 
         // DBLP 未找到，尝试 Crossref（覆盖所有领域）
@@ -488,9 +659,14 @@ function makeRequest(options) {
             buttonState.setLoading(lang_hint.searching_crossref);
             Toast(lang_hint.trying_crossref, 'info');
         }
-        const crossrefResult = await fetchBibTeXFromCrossref(query);
+        const crossrefResult = await fetchBibTeXFromCrossref(query, 5);
         if (crossrefResult) {
-            return { bibtex: crossrefResult, source: 'Crossref' };
+            // 检查是否是多个结果
+            if (Array.isArray(crossrefResult)) {
+                return { results: crossrefResult, source: 'Crossref', isMultiple: true };
+            } else {
+                return { bibtex: crossrefResult, source: 'Crossref', isMultiple: false };
+            }
         }
 
         Toast(lang_hint.error_all_sources_failed, 'error');
@@ -534,7 +710,7 @@ function makeRequest(options) {
         };
     };
 
-    // ========== 按钮点击事件（支持预览和历史） ==========
+    // ========== 按钮点击事件（支持预览、历史、多结果选择） ==========
     const handleButtonClick = async (showPreview = false) => {
         const selection = window.getSelection().toString().trim();
         if (!selection) {
@@ -546,20 +722,43 @@ function makeRequest(options) {
 
         try {
             const result = await fetchBibTeX(selection, true);
-            if (result && result.bibtex) {
-                // 添加到历史记录
-                history.add(selection, result.bibtex, result.source);
-                
-                if (showPreview) {
-                    // 显示预览
-                    showBibTeXPreview(result.bibtex, result.source, () => {
-                        GM_setClipboard(result.bibtex);
-                        Toast(lang_hint.success_bibtex_copied, 'success');
+            if (result) {
+                // 处理多结果情况
+                if (result.isMultiple && result.results) {
+                    buttonState.reset();
+                    showMultipleResults(result.results, (selectedResult) => {
+                        // 添加到历史记录
+                        history.add(selection, selectedResult.bibtex, result.source);
+                        
+                        if (showPreview) {
+                            showBibTeXPreview(selectedResult.bibtex, result.source, () => {
+                                GM_setClipboard(selectedResult.bibtex);
+                                Toast(lang_hint.success_bibtex_copied, 'success');
+                            });
+                        } else {
+                            GM_setClipboard(selectedResult.bibtex);
+                            Toast(`${lang_hint.success_bibtex_copied} (${result.source})`, 'success');
+                        }
                     });
-                } else {
-                    // 直接复制
-                    GM_setClipboard(result.bibtex);
-                    Toast(`${lang_hint.success_bibtex_copied} (${result.source})`, 'success');
+                    return;
+                }
+                
+                // 处理单个结果
+                if (result.bibtex) {
+                    // 添加到历史记录
+                    history.add(selection, result.bibtex, result.source);
+                    
+                    if (showPreview) {
+                        // 显示预览
+                        showBibTeXPreview(result.bibtex, result.source, () => {
+                            GM_setClipboard(result.bibtex);
+                            Toast(lang_hint.success_bibtex_copied, 'success');
+                        });
+                    } else {
+                        // 直接复制
+                        GM_setClipboard(result.bibtex);
+                        Toast(`${lang_hint.success_bibtex_copied} (${result.source})`, 'success');
+                    }
                 }
             }
         } catch (error) {
@@ -593,6 +792,31 @@ function makeRequest(options) {
         GM_setValue('showButton', button.style.display === 'block');
     });
     
+    // ========== 导出历史记录为 .bib 文件 ==========
+    function exportHistory() {
+        const h = history.get();
+        if (h.length === 0) {
+            Toast(lang_hint.no_history, 'info');
+            return;
+        }
+        
+        // 合并所有 BibTeX 条目
+        const bibContent = h.map(item => item.bibtex).join('\n\n');
+        
+        // 创建下载链接
+        const blob = new Blob([bibContent], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = lang_hint.export_filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        Toast(lang_hint.export_success, 'success');
+    }
+
     GM_registerMenuCommand(lang_hint.history_title, function() {
         const h = history.get();
         if (h.length === 0) {
@@ -641,6 +865,15 @@ function makeRequest(options) {
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
                 <h3 style="margin: 0; color: #333;">${lang_hint.history_title}</h3>
                 <div>
+                    <button id="export-history" style="
+                        padding: 6px 12px;
+                        background: #28a745;
+                        color: white;
+                        border: none;
+                        border-radius: 6px;
+                        cursor: pointer;
+                        margin-right: 8px;
+                    ">${lang_hint.export_history}</button>
                     <button id="clear-history" style="
                         padding: 6px 12px;
                         background: #dc3545;
@@ -672,6 +905,10 @@ function makeRequest(options) {
         };
         
         modal.querySelector('#close-history').addEventListener('click', closeModal);
+        modal.querySelector('#export-history').addEventListener('click', () => {
+            exportHistory();
+            closeModal();
+        });
         modal.querySelector('#clear-history').addEventListener('click', () => {
             if (confirm('确定要清空历史记录吗？')) {
                 history.clear();

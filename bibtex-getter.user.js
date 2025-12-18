@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         选择文本并自动获取BibTex到剪切板
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.4
 // @description  在网页右下角生成一个按钮，从dblp或Crossref中获取选定文本的BibTeX并复制到剪贴板，支持DOI检测、多结果选择、导出历史记录
 // @author       ff
 // @match        *://*/*
+// @noframes
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
 // @grant        GM_registerMenuCommand
@@ -24,7 +25,7 @@ const CONFIG = {
 // ========== Toast 消息组件（支持类型） ==========
 function Toast(msg, type = 'info', duration = CONFIG.TOAST_DURATION) {
     duration = isNaN(duration) ? CONFIG.TOAST_DURATION : duration;
-    
+
     // 根据类型设置图标和颜色
     const icons = {
         success: '✓',
@@ -38,7 +39,7 @@ function Toast(msg, type = 'info', duration = CONFIG.TOAST_DURATION) {
         info: 'rgba(0, 0, 0, 0.85)',
         warning: 'rgba(255, 193, 7, 0.9)'
     };
-    
+
     const m = document.createElement('div');
     m.innerHTML = `<span style="margin-right: 8px; font-weight: bold;">${icons[type] || icons.info}</span>${msg}`;
     Object.assign(m.style, {
@@ -126,10 +127,17 @@ function makeRequest(options) {
         });
     });
 }
-  
+
   (function() {
     'use strict';
-  
+
+    // 避免在 iframe / 嵌入式弹窗里注入按钮（很多站点的“弹窗”其实是 iframe）
+    try {
+        if (window.top !== window.self) return;
+    } catch (_) {
+        return;
+    }
+
     const lang = navigator.language || navigator.userLanguage;
     let lang_hint = {};
     switch (lang){
@@ -218,8 +226,8 @@ function makeRequest(options) {
         };
         break;
     }
-  
-  
+
+
     // ========== 创建按钮（带图标） ==========
     const button = document.createElement('button');
     button.innerHTML = '<span style="margin-right: 6px;">📋</span>Get BibTeX';
@@ -259,14 +267,14 @@ function makeRequest(options) {
         }
     });
     document.body.appendChild(button);
-  
+
     // Show/hide button based on user preference
     if (GM_getValue('showButton', true)) {
         button.style.display = 'block';
     } else {
         button.style.display = 'none';
     }
-  
+
     // ========== DOI 检测函数 ==========
     function extractDOI(text) {
         // DOI 格式: 10.xxxx/xxxx 或 doi:10.xxxx/xxxx
@@ -435,7 +443,7 @@ function makeRequest(options) {
             align-items: center;
             justify-content: center;
         `;
-        
+
         const modal = document.createElement('div');
         modal.style.cssText = `
             background: white;
@@ -447,7 +455,7 @@ function makeRequest(options) {
             display: flex;
             flex-direction: column;
         `;
-        
+
         modal.innerHTML = `
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
                 <h3 style="margin: 0; color: #333;">${lang_hint.preview_title} (${source})</h3>
@@ -484,25 +492,25 @@ function makeRequest(options) {
                 ">${lang_hint.close_button}</button>
             </div>
         `;
-        
+
         overlay.appendChild(modal);
         document.body.appendChild(overlay);
-        
+
         const closeModal = () => {
             document.body.removeChild(overlay);
         };
-        
+
         modal.querySelector('#close-preview').addEventListener('click', closeModal);
         modal.querySelector('#close-preview-btn').addEventListener('click', closeModal);
         modal.querySelector('#copy-bibtex').addEventListener('click', () => {
             onCopy();
             closeModal();
         });
-        
+
         overlay.addEventListener('click', (e) => {
             if (e.target === overlay) closeModal();
         });
-        
+
         // ESC 键关闭
         const escHandler = (e) => {
             if (e.key === 'Escape') {
@@ -547,7 +555,7 @@ function makeRequest(options) {
             align-items: center;
             justify-content: center;
         `;
-        
+
         const modal = document.createElement('div');
         modal.style.cssText = `
             background: white;
@@ -560,7 +568,7 @@ function makeRequest(options) {
             flex-direction: column;
             overflow: hidden;
         `;
-        
+
         const resultsList = results.map((result, index) => `
             <div style="
                 padding: 16px;
@@ -569,16 +577,16 @@ function makeRequest(options) {
                 margin-bottom: 12px;
                 cursor: pointer;
                 transition: all 0.2s;
-            " 
-            data-index="${index}" 
-            onmouseover="this.style.borderColor='#007BFF'; this.style.background='#f0f7ff'" 
+            "
+            data-index="${index}"
+            onmouseover="this.style.borderColor='#007BFF'; this.style.background='#f0f7ff'"
             onmouseout="this.style.borderColor='#e0e0e0'; this.style.background='white'">
                 <div style="font-weight: 600; margin-bottom: 8px; color: #333; font-size: 15px;">${result.title}</div>
                 <div style="font-size: 13px; color: #666; margin-bottom: 4px;">${result.authors}</div>
                 <div style="font-size: 12px; color: #999;">${result.year} • DOI: ${result.doi}</div>
             </div>
         `).join('');
-        
+
         modal.innerHTML = `
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
                 <h3 style="margin: 0; color: #333;">${lang_hint.multiple_results}</h3>
@@ -598,17 +606,17 @@ function makeRequest(options) {
                 ">${lang_hint.cancel}</button>
             </div>
         `;
-        
+
         overlay.appendChild(modal);
         document.body.appendChild(overlay);
-        
+
         const closeModal = () => {
             document.body.removeChild(overlay);
         };
-        
+
         modal.querySelector('#close-results').addEventListener('click', closeModal);
         modal.querySelector('#cancel-results').addEventListener('click', closeModal);
-        
+
         modal.querySelectorAll('[data-index]').forEach(item => {
             item.addEventListener('click', () => {
                 const index = parseInt(item.getAttribute('data-index'));
@@ -616,11 +624,11 @@ function makeRequest(options) {
                 closeModal();
             });
         });
-        
+
         overlay.addEventListener('click', (e) => {
             if (e.target === overlay) closeModal();
         });
-        
+
         // ESC 键关闭
         const escHandler = (e) => {
             if (e.key === 'Escape') {
@@ -672,7 +680,7 @@ function makeRequest(options) {
         Toast(lang_hint.error_all_sources_failed, 'error');
         return null;
     }
-  
+
     // ========== 按钮状态管理（带加载动画） ==========
     const buttonState = {
         originalHTML: button.innerHTML,
@@ -729,7 +737,7 @@ function makeRequest(options) {
                     showMultipleResults(result.results, (selectedResult) => {
                         // 添加到历史记录
                         history.add(selection, selectedResult.bibtex, result.source);
-                        
+
                         if (showPreview) {
                             showBibTeXPreview(selectedResult.bibtex, result.source, () => {
                                 GM_setClipboard(selectedResult.bibtex);
@@ -742,12 +750,12 @@ function makeRequest(options) {
                     });
                     return;
                 }
-                
+
                 // 处理单个结果
                 if (result.bibtex) {
                     // 添加到历史记录
                     history.add(selection, result.bibtex, result.source);
-                    
+
                     if (showPreview) {
                         // 显示预览
                         showBibTeXPreview(result.bibtex, result.source, () => {
@@ -771,7 +779,7 @@ function makeRequest(options) {
 
     // 左键点击：直接复制
     button.addEventListener('click', debounce(() => handleButtonClick(false), CONFIG.DEBOUNCE_DELAY));
-    
+
     // 右键点击：显示预览
     button.addEventListener('contextmenu', (e) => {
         e.preventDefault();
@@ -785,13 +793,44 @@ function makeRequest(options) {
             handleButtonClick(false);
         }
     });
-  
+
+    // ========== Google Scholar 结果页：直接点击图标复制 BibTeX ==========
+    function initGoogleScholarBibtexCopy() {
+        // 仅在 Google Scholar 页面生效
+        if (!/scholar\.google\./.test(location.hostname)) return;
+
+        const links = document.querySelectorAll('a.gs_nta.gs_nph');
+        if (!links.length) return;
+
+        links.forEach(link => {
+            // 避免重复绑定
+            if (link.dataset.bibtexEnhanced === '1') return;
+            link.dataset.bibtexEnhanced = '1';
+
+            link.addEventListener('click', (e) => {
+                e.preventDefault();
+
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: link.href,
+                    onload: ({ responseText }) => {
+                        GM_setClipboard(responseText);
+                        Toast(lang_hint.success_bibtex_copied, 'success');
+                    },
+                    onerror: () => {
+                        Toast('从 Google Scholar 获取 BibTeX 失败', 'error');
+                    }
+                });
+            });
+        });
+    }
+
     // ========== 右键菜单选项 ==========
     GM_registerMenuCommand(lang_hint.show_button, function() {
         button.style.display = button.style.display === 'none' ? 'block' : 'none';
         GM_setValue('showButton', button.style.display === 'block');
     });
-    
+
     // ========== 导出历史记录为 .bib 文件 ==========
     function exportHistory() {
         const h = history.get();
@@ -799,10 +838,10 @@ function makeRequest(options) {
             Toast(lang_hint.no_history, 'info');
             return;
         }
-        
+
         // 合并所有 BibTeX 条目
         const bibContent = h.map(item => item.bibtex).join('\n\n');
-        
+
         // 创建下载链接
         const blob = new Blob([bibContent], { type: 'text/plain' });
         const url = URL.createObjectURL(blob);
@@ -813,7 +852,7 @@ function makeRequest(options) {
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        
+
         Toast(lang_hint.export_success, 'success');
     }
 
@@ -823,7 +862,7 @@ function makeRequest(options) {
             Toast(lang_hint.no_history, 'info');
             return;
         }
-        
+
         const overlay = document.createElement('div');
         overlay.style.cssText = `
             position: fixed;
@@ -837,7 +876,7 @@ function makeRequest(options) {
             align-items: center;
             justify-content: center;
         `;
-        
+
         const modal = document.createElement('div');
         modal.style.cssText = `
             background: white;
@@ -850,17 +889,17 @@ function makeRequest(options) {
             flex-direction: column;
             overflow: hidden;
         `;
-        
+
         const historyList = h.map((item, index) => `
-            <div style="padding: 12px; border-bottom: 1px solid #eee; cursor: pointer;" 
-                 data-index="${index}" 
-                 onmouseover="this.style.background='#f5f5f5'" 
+            <div style="padding: 12px; border-bottom: 1px solid #eee; cursor: pointer;"
+                 data-index="${index}"
+                 onmouseover="this.style.background='#f5f5f5'"
                  onmouseout="this.style.background='white'">
                 <div style="font-weight: 500; margin-bottom: 4px; color: #333;">${item.query.substring(0, 60)}${item.query.length > 60 ? '...' : ''}</div>
                 <div style="font-size: 12px; color: #666;">${item.source} • ${new Date(item.timestamp).toLocaleString()}</div>
             </div>
         `).join('');
-        
+
         modal.innerHTML = `
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
                 <h3 style="margin: 0; color: #333;">${lang_hint.history_title}</h3>
@@ -896,14 +935,14 @@ function makeRequest(options) {
                 ${historyList}
             </div>
         `;
-        
+
         overlay.appendChild(modal);
         document.body.appendChild(overlay);
-        
+
         const closeModal = () => {
             document.body.removeChild(overlay);
         };
-        
+
         modal.querySelector('#close-history').addEventListener('click', closeModal);
         modal.querySelector('#export-history').addEventListener('click', () => {
             exportHistory();
@@ -916,7 +955,7 @@ function makeRequest(options) {
                 Toast('历史记录已清空', 'success');
             }
         });
-        
+
         modal.querySelectorAll('[data-index]').forEach(item => {
             item.addEventListener('click', () => {
                 const index = parseInt(item.getAttribute('data-index'));
@@ -927,10 +966,13 @@ function makeRequest(options) {
                 });
             });
         });
-        
+
         overlay.addEventListener('click', (e) => {
             if (e.target === overlay) closeModal();
         });
     });
-  })();
 
+    // 初始化 Google Scholar BibTeX 直接复制功能
+    initGoogleScholarBibtexCopy();
+
+  })();

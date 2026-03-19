@@ -1,10 +1,18 @@
 // ==UserScript==
 // @name         选择文本并自动获取BibTex到剪切板
 // @namespace    http://tampermonkey.net/
-// @version      1.4
-// @description  在网页右下角生成一个按钮，从dblp或Crossref中获取选定文本的BibTeX并复制到剪贴板，支持DOI检测、多结果选择、导出历史记录
+// @version      1.5
+// @description  在网页右下角生成一个按钮，从dblp或Crossref中获取选定文本的BibTeX并复制到剪贴板，支持DOI检测、多结果选择、自动补充摘要、导出历史记录
 // @author       ff
 // @match        *://*/*
+// @connect      dblp.org
+// @connect      api.crossref.org
+// @connect      api.semanticscholar.org
+// @connect      semanticscholar.org
+// @connect      api.openalex.org
+// @connect      scholar.google.com
+// @connect      scholar.googleusercontent.com
+// @connect      usage.trackjs.com
 // @noframes
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
@@ -167,6 +175,9 @@ function makeRequest(options) {
           cancel:"取消",
           export_success:"历史记录已导出！",
           export_filename:"bibtex-history.bib",
+          abstract_appended:"已补充摘要",
+          abstract_not_found:"未找到摘要（数据源可能不提供）",
+          abstract_already_present:"已包含摘要",
         };
         break;
       case "zh":
@@ -196,6 +207,9 @@ function makeRequest(options) {
           cancel:"取消",
           export_success:"歷史記錄已導出！",
           export_filename:"bibtex-history.bib",
+          abstract_appended:"已補充摘要",
+          abstract_not_found:"未找到摘要（數據源可能不提供）",
+          abstract_already_present:"已包含摘要",
         };
         break;
       default:
@@ -223,6 +237,9 @@ function makeRequest(options) {
           cancel:"Cancel",
           export_success:"History exported successfully!",
           export_filename:"bibtex-history.bib",
+          abstract_appended:"Abstract appended",
+          abstract_not_found:"No abstract found (source may not provide it)",
+          abstract_already_present:"Abstract included",
         };
         break;
     }
@@ -283,12 +300,174 @@ function makeRequest(options) {
         return match ? match[1] : null;
     }
 
+    // 清洗摘要，去掉 HTML/JATS 标签
+    function cleanAbstract(abstractText) {
+        if (!abstractText) return '';
+        return abstractText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function hasAbstractField(bibtex) {
+        return !!(bibtex && /abstract\s*=\s*[{"]/.test(bibtex));
+    }
+
+    // 如果 BibTeX 没有摘要则尝试追加
+    function appendAbstractIfMissing(bibtex, abstractText) {
+        if (!bibtex) return bibtex;
+        if (hasAbstractField(bibtex)) return bibtex;
+        const cleaned = cleanAbstract(abstractText);
+        if (!cleaned) return bibtex;
+        if (/\n}\s*$/m.test(bibtex)) {
+            return bibtex.replace(/\n}\s*$/m, `,\n  abstract = {${cleaned}}\n}\n`);
+        }
+        return `${bibtex}\n  abstract = {${cleaned}}\n}\n`;
+    }
+
+    // 从 BibTeX 中解析 DOI
+    function extractDOIFromBibtex(bibtex) {
+        const match = bibtex.match(/doi\s*=\s*[{"]\s*([^}",\s]+)\s*[}"]/i);
+        return match ? match[1].trim() : null;
+    }
+
+    // 通过 DOI 获取摘要（Crossref JSON / Semantic Scholar / OpenAlex）
+    async function fetchAbstractByDOI(doi) {
+        const cacheKey = `abstract_${doi}`;
+        const cached = cache.get(cacheKey);
+        if (cached) return cached;
+
+        // 1) Crossref: message.abstract (可能为 JATS/HTML)
+        try {
+            const url = `https://api.crossref.org/works/${encodeURIComponent(doi)}`;
+            const res = await makeRequest({
+                method: 'GET',
+                url,
+                headers: {
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
+            });
+            if (res.status === 200) {
+                const data = JSON.parse(res.responseText);
+                const abs = cleanAbstract(data.message?.abstract || '');
+                if (abs) {
+                    cache.set(cacheKey, abs);
+                    return abs;
+                }
+            }
+        } catch (err) {
+            console.error('Crossref abstract fetch error:', err);
+        }
+
+        // 2) Semantic Scholar: Graph API（通常可返回 abstract；不保证每条都有）
+        //    若 API 不返回 abstract，则用 paperId 打开网页解析 <meta name="description"> 作为兜底摘要
+        try {
+            const s2Url = `https://api.semanticscholar.org/graph/v1/paper/DOI:${encodeURIComponent(doi)}?fields=paperId,abstract`;
+            const res = await makeRequest({
+                method: 'GET',
+                url: s2Url,
+                headers: {
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
+            });
+            if (res.status === 200) {
+                const data = JSON.parse(res.responseText);
+                let abs = cleanAbstract(data?.abstract || '');
+
+                // 兜底：API 没给摘要（常见于过长/缺失），尝试抓网页 meta description
+                if (!abs && data?.paperId) {
+                    try {
+                        const htmlRes = await makeRequest({
+                            method: 'GET',
+                            url: `https://www.semanticscholar.org/paper/${encodeURIComponent(data.paperId)}`,
+                            headers: {
+                                "Accept": "text/html,application/xhtml+xml",
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                            }
+                        });
+                        if (htmlRes.status === 200 && htmlRes.responseText) {
+                            const doc = new DOMParser().parseFromString(htmlRes.responseText, 'text/html');
+                            const meta = doc.querySelector('meta[name="description"]');
+                            const content = meta?.getAttribute('content') || '';
+                            // 部分页面 description 可能是站点提示文案
+                            if (content && !content.startsWith('Semantic Scholar')) {
+                                abs = cleanAbstract(content);
+                            }
+                        }
+                    } catch (e) {
+                        console.error('Semantic Scholar HTML fallback error:', e);
+                    }
+                }
+
+                if (abs) {
+                    cache.set(cacheKey, abs);
+                    return abs;
+                }
+            }
+        } catch (err) {
+            console.error('Semantic Scholar abstract fetch error:', err);
+        }
+
+        // 3) OpenAlex: abstract_inverted_index（需要还原成字符串；不保证每条都有）
+        try {
+            const oaUrl = `https://api.openalex.org/works/https://doi.org/${encodeURIComponent(doi)}`;
+            const res = await makeRequest({
+                method: 'GET',
+                url: oaUrl,
+                headers: {
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
+            });
+            if (res.status === 200) {
+                const data = JSON.parse(res.responseText);
+                const inv = data?.abstract_inverted_index;
+                if (inv && typeof inv === 'object') {
+                    let maxPos = -1;
+                    for (const positions of Object.values(inv)) {
+                        if (!Array.isArray(positions)) continue;
+                        for (const p of positions) {
+                            if (typeof p === 'number' && p > maxPos) maxPos = p;
+                        }
+                    }
+                    if (maxPos >= 0) {
+                        const words = new Array(maxPos + 1);
+                        for (const [word, positions] of Object.entries(inv)) {
+                            if (!Array.isArray(positions)) continue;
+                            for (const p of positions) {
+                                if (typeof p === 'number') words[p] = word;
+                            }
+                        }
+                        const abs = cleanAbstract(words.filter(Boolean).join(' '));
+                        if (abs) {
+                            cache.set(cacheKey, abs);
+                            return abs;
+                        }
+                    }
+                }
+            }
+        } catch (err) {
+            console.error('OpenAlex abstract fetch error:', err);
+        }
+
+        return '';
+    }
+
     // ========== 使用 DOI 直接获取 BibTeX ==========
     async function fetchBibTeXByDOI(doi) {
         const cacheKey = `doi_${doi}`;
         const cached = cache.get(cacheKey);
         if (cached) {
-            return cached;
+            // 兼容旧缓存：缓存命中但缺摘要时，仍尝试补齐
+            let bibtex = cached;
+            if (!hasAbstractField(bibtex)) {
+                const abstract = await fetchAbstractByDOI(doi);
+                const next = appendAbstractIfMissing(bibtex, abstract);
+                if (next !== bibtex) {
+                    bibtex = next;
+                    cache.set(cacheKey, bibtex);
+                }
+            }
+            return bibtex;
         }
 
         try {
@@ -303,7 +482,10 @@ function makeRequest(options) {
             });
 
             if (bibResponse.status === 200 && bibResponse.responseText.trim()) {
-                const bibtex = bibResponse.responseText;
+                let bibtex = bibResponse.responseText;
+                // 若缺摘要则尝试补充
+                const abstract = await fetchAbstractByDOI(doi);
+                bibtex = appendAbstractIfMissing(bibtex, abstract);
                 cache.set(cacheKey, bibtex);
                 return bibtex;
             }
@@ -319,9 +501,7 @@ function makeRequest(options) {
         // 检查缓存
         const cacheKey = `crossref_${query}`;
         const cached = cache.get(cacheKey);
-        if (cached) {
-            return Array.isArray(cached) ? cached : [cached];
-        }
+        if (cached) return cached;
 
         try {
             // 搜索获取多个结果
@@ -348,7 +528,9 @@ function makeRequest(options) {
             const results = [];
             for (const item of data.message.items) {
                 if (item.DOI) {
-                    const bibtex = await fetchBibTeXByDOI(item.DOI);
+                    let bibtex = await fetchBibTeXByDOI(item.DOI);
+                    // 如果直接 DOI 获取未包含摘要，尝试使用搜索结果中的摘要补充（少数情况下 Crossref items 里会带）
+                    bibtex = appendAbstractIfMissing(bibtex, item.abstract);
                     if (bibtex) {
                         results.push({
                             bibtex: bibtex,
@@ -362,8 +544,9 @@ function makeRequest(options) {
             }
 
             if (results.length > 0) {
-                cache.set(cacheKey, results.length === 1 ? results[0].bibtex : results);
-                return results.length === 1 ? results[0].bibtex : results;
+                const payload = results.length === 1 ? results[0].bibtex : results;
+                cache.set(cacheKey, payload);
+                return payload;
             }
             return null;
         } catch (error) {
@@ -378,7 +561,20 @@ function makeRequest(options) {
         const cacheKey = `dblp_${query}`;
         const cached = cache.get(cacheKey);
         if (cached) {
-            return cached;
+            // 兼容旧缓存：缓存命中但缺摘要时，尝试按 DOI 补齐
+            let bibtex = cached;
+            if (!hasAbstractField(bibtex)) {
+                const doiInBib = extractDOIFromBibtex(bibtex);
+                if (doiInBib) {
+                    const abstract = await fetchAbstractByDOI(doiInBib);
+                    const next = appendAbstractIfMissing(bibtex, abstract);
+                    if (next !== bibtex) {
+                        bibtex = next;
+                        cache.set(cacheKey, bibtex);
+                    }
+                }
+            }
+            return bibtex;
         }
 
         try {
@@ -417,7 +613,13 @@ function makeRequest(options) {
             });
 
             if (bibResponse.status === 200 && bibResponse.responseText.trim()) {
-                const bibtex = bibResponse.responseText;
+                let bibtex = bibResponse.responseText;
+                // DBLP 通常无摘要，尝试通过 DOI 从 Crossref/S2/OpenAlex 补充
+                const doiInBib = extractDOIFromBibtex(bibtex);
+                if (doiInBib) {
+                    const abstract = await fetchAbstractByDOI(doiInBib);
+                    bibtex = appendAbstractIfMissing(bibtex, abstract);
+                }
                 cache.set(cacheKey, bibtex);
                 return bibtex;
             }
@@ -741,11 +943,13 @@ function makeRequest(options) {
                         if (showPreview) {
                             showBibTeXPreview(selectedResult.bibtex, result.source, () => {
                                 GM_setClipboard(selectedResult.bibtex);
-                                Toast(lang_hint.success_bibtex_copied, 'success');
+                                const abstractHint = hasAbstractField(selectedResult.bibtex) ? lang_hint.abstract_already_present : lang_hint.abstract_not_found;
+                                Toast(`${lang_hint.success_bibtex_copied}（${abstractHint}）`, 'success');
                             });
                         } else {
                             GM_setClipboard(selectedResult.bibtex);
-                            Toast(`${lang_hint.success_bibtex_copied} (${result.source})`, 'success');
+                            const abstractHint = hasAbstractField(selectedResult.bibtex) ? lang_hint.abstract_already_present : lang_hint.abstract_not_found;
+                            Toast(`${lang_hint.success_bibtex_copied} (${result.source})（${abstractHint}）`, 'success');
                         }
                     });
                     return;
@@ -760,12 +964,14 @@ function makeRequest(options) {
                         // 显示预览
                         showBibTeXPreview(result.bibtex, result.source, () => {
                             GM_setClipboard(result.bibtex);
-                            Toast(lang_hint.success_bibtex_copied, 'success');
+                            const abstractHint = hasAbstractField(result.bibtex) ? lang_hint.abstract_already_present : lang_hint.abstract_not_found;
+                            Toast(`${lang_hint.success_bibtex_copied}（${abstractHint}）`, 'success');
                         });
                     } else {
                         // 直接复制
                         GM_setClipboard(result.bibtex);
-                        Toast(`${lang_hint.success_bibtex_copied} (${result.source})`, 'success');
+                        const abstractHint = hasAbstractField(result.bibtex) ? lang_hint.abstract_already_present : lang_hint.abstract_not_found;
+                        Toast(`${lang_hint.success_bibtex_copied} (${result.source})（${abstractHint}）`, 'success');
                     }
                 }
             }
@@ -799,10 +1005,29 @@ function makeRequest(options) {
         // 仅在 Google Scholar 页面生效
         if (!/scholar\.google\./.test(location.hostname)) return;
 
-        const links = document.querySelectorAll('a.gs_nta.gs_nph');
-        if (!links.length) return;
+        // 注入全局 CSS 样式，确保页面加载时就显示红色
+        if (!document.getElementById('bibtex-red-style')) {
+            const style = document.createElement('style');
+            style.id = 'bibtex-red-style';
+            style.textContent = `
+                a.gs_nta.gs_nph[data-bibtex-enhanced="1"] {
+                    color: #dc3545 !important;
+                    font-weight: 600 !important;
+                    text-decoration: none !important;
+                    transition: all 0.2s ease !important;
+                    display: inline-block !important;
+                }
+                a.gs_nta.gs_nph[data-bibtex-enhanced="1"]:hover {
+                    color: #ff0000 !important;
+                    text-decoration: underline !important;
+                    transform: scale(1.05) !important;
+                }
+            `;
+            document.head.appendChild(style);
+        }
 
-        links.forEach(link => {
+        // 处理链接的函数
+        function enhanceLink(link) {
             // 避免重复绑定
             if (link.dataset.bibtexEnhanced === '1') return;
             link.dataset.bibtexEnhanced = '1';
@@ -822,6 +1047,33 @@ function makeRequest(options) {
                     }
                 });
             });
+        }
+
+        // 初始化已存在的链接
+        document.querySelectorAll('a.gs_nta.gs_nph').forEach(enhanceLink);
+
+        // 监听 DOM 变化，处理动态加载的链接
+        const observer = new MutationObserver((mutations) => {
+            mutations.forEach((mutation) => {
+                mutation.addedNodes.forEach((node) => {
+                    if (node.nodeType === 1) { // 元素节点
+                        // 检查节点本身
+                        if (node.matches && node.matches('a.gs_nta.gs_nph')) {
+                            enhanceLink(node);
+                        }
+                        // 检查子节点
+                        if (node.querySelectorAll) {
+                            node.querySelectorAll('a.gs_nta.gs_nph').forEach(enhanceLink);
+                        }
+                    }
+                });
+            });
+        });
+
+        // 开始观察
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
         });
     }
 

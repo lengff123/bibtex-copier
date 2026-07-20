@@ -1,0 +1,17 @@
+Set-Location 'C:\Users\LAB\Documents\GitHub\bibtex-copier'
+
+@'
+bibtex-getter.user copy.js
+__pycache__/
+*.py[cod]
+.venv/
+.env
+node_modules/
+dist/
+Documents/
+build/
+*.log
+.DS_Store
+Thumbs.db
+~$*.pptx
+'@ | Set-Content -Encoding UTF8 .gitignore
